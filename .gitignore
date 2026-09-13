@@ -1,0 +1,46 @@
+﻿# Environment
+.env
+# .env.*
+# !.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+pip-log.txt
+
+# Virtual environment
+venv/
+env/
+.venv/
+ENV/
+
+# LangGraph checkpoints
+checkpoints/
+*.db
+*.sqlite
+
+# Qdrant storage
+qdrant_storage/
+
+# Streamlit
+.streamlit/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+
+# Large data
+twcs.csv
+data/filtered_amazon_dataset.csv
+data/intermediate_amazon_dataset.csv
