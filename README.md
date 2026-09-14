@@ -93,6 +93,9 @@ streamlit run app.py  # make sure venv is working (active) as mentioned in previ
 ```
 
 Open your browser at **http://localhost:8501**
+I am attaching few prompts below the video demo.
+
+https://github.com/user-attachments/assets/84f10a13-81d2-4f9d-94f1-51dfb4f52bae
 
 ## Few Prompt examples for testing:
 
