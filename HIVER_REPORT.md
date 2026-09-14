@@ -1,7 +1,7 @@
 # Hiver Assignment Report
-**Candidate Submission for `@AmazonHelp` Customer Support AI Agent**
+**Submission for `@AmazonHelp` Customer Support AI Agent**
 **Target Brand**: `@AmazonHelp` (Twitter / X Customer Support)  
-**Evaluation Date**: 2026-09-13  
+**Evaluation Date**: 2026-09-14  
 **Provider & Models**: Hugging Face Free Models (`Qwen/Qwen3.8-27B` & `deepseek-ai/DeepSeek-V4.1-Flash`)
 
 ---
@@ -146,3 +146,7 @@ While our headline **Overall RAG Score of 0.6350 (63.5%)** (or **0.6750 / 67.5%*
 
 13. **Handling Incorrect Context**: If the retrieved context is incorrect, then we don't have enough relevant information about the user's query, so we simply escalate the query to the human agent with reasons.
 
+### I have made handwritten golden_evaluation_dataset on refined sample of large 1M rows noisy dataset and tested 15 seperate conversations because of Hugging Face free credit limits of just 0.1$ credits gets overed in 5-7 queries.
+
+## Please find sampled dataset and golden dataset at ./data folder
+Please read agent_iteration_01.md, agent_iteration_02.md and agent_iteration_03.md if you wanted to understand how I have sampled 1M rows noisy dataset and made golden dataset without randomly picking any conversation rows but using probablistic model of fine mixture to sample it out.

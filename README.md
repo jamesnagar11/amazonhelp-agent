@@ -13,7 +13,7 @@ User Query → LangGraph CRAG Pipeline → Streamlit Frontend
                ├── Query Rewriting + HyDE (DeepSeek-V3)
                ├── Vector Retrieval (Qdrant + BAAI/bge)
                ├── Document Evaluation (DeepSeek-V3)
-               ├── Strip Scoring & Filtering (Qwen3)
+               ├── Strip Scoring & Filtering (Qwen3)  |Re-ranking|
                └── Final Answer / Human Escalation (Qwen3)
 ```
 
@@ -26,87 +26,51 @@ User Query → LangGraph CRAG Pipeline → Streamlit Frontend
 
 ---
 
-## Prerequisites
-
-- **Python 3.10+** (tested on 3.14)
+## Prerequisites (Need to be installed locally to run this project)
+- **Python 3.10+**
 - **Docker** (for local Qdrant)
-- **Hugging Face account** with a token that has Inference API access
 
 ---
 
 ## Setup Instructions
 
-### Step 1 — Clone / Navigate to project
-
-```bash
-cd d:/langchain/project
+```
+git clone https://github.com/jamesnagar11/amazonhelp-agent.git
+cd amazonhelp-agent
 ```
 
-### Step 2 — Create and activate virtual environment
-
 ```bash
-# Create venv (skip if already exists)
 python -m venv venv
+```
 
-# Activate (Windows)
+For Windows
+```
 venv\Scripts\activate
-
-# Activate (Linux/Mac)
+```
+For Linux/Mac
+```
 source venv/bin/activate
 ```
 
-### Step 3 — Install dependencies
-
+Installing Dependencies (Might take upto ~ 6 minutes) # Please be patience
 ```bash
 pip install -r requirements.txt
 ```
 
-### Step 4 — Configure environment variables
+Configure environment variables
 
 ```bash
-# Copy the example file
 copy .env.example .env    # Windows
 cp .env.example .env      # Linux/Mac
 ```
 
-Open `.env` and fill in your values:
 
-```env
-# Hugging Face token (get from https://huggingface.co/settings/tokens)
-HF_TOKEN=hf_your_actual_token_here
-
-# Qdrant (leave as-is for local Docker)
-QDRANT_HOST=localhost
-QDRANT_PORT=6333
-QDRANT_COLLECTION=amazon_support
-
-# Models (change only if you want different models)
-EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
-CHAT_MODEL=Qwen/Qwen3-8B
-JUDGE_MODEL=deepseek-ai/DeepSeek-V3-0324
-
-# Memory settings
-SQLITE_PATH=./checkpoints/chat_checkpoints.db
-MAX_MESSAGES=10
-MAX_TOKENS=3000
-```
-
-### Step 5 — Start Qdrant (local Docker)
+### Start Qdrant (local Docker)
 
 ```bash
-docker run -d -p 6333:6333 -p 6334:6334 \
-  -v $(pwd)/qdrant_storage:/qdrant/storage \
-  --name qdrant_amazon \
-  qdrant/qdrant
+docker run -d -p 6333:6333 -p 6334:6334 -v "./qdrant_storage:/qdrant/storage" --name qdrant_amazon qdrant/qdrant
 ```
 
-> **Windows PowerShell:**
-> ```powershell
-> docker run -d -p 6333:6333 -p 6334:6334 `
->   -v "${PWD}/qdrant_storage:/qdrant/storage" `
->   --name qdrant_amazon `
->   qdrant/qdrant
-> ```
 
 Verify Qdrant is running:
 ```bash
@@ -114,33 +78,18 @@ curl http://localhost:6333/collections
 # Should return {"result":{"collections":[]},"status":"ok",...}
 ```
 
-### Step 6 — Run the ingestion pipeline
+### Run the ingestion pipeline (takes around ~ 4 minutes)
 
 This embeds `data/sample_amazon_dataset.csv` into Qdrant. **Run once** — it detects if already ingested and skips.
 
 ```bash
-# Activate venv first!
-venv\Scripts\activate   # Windows
-
-python -m src.ingestion.ingest
+python -m src.ingestion.ingest # make sure venv is working (active) as mentioned in previous step, or run "venv\Scripts\activate" first in windows and equivalent command in mac/linux
 ```
 
-Expected output:
-```
-[INFO] Loading CSV from: data/sample_amazon_dataset.csv
-[INFO] Loaded 4367 raw documents
-[INFO] Split into ~18000 chunks
-[INFO] Embedding dimension: 384
-[INFO] Upserting in batches...
-[INFO] ✅ Ingestion complete! Collection 'amazon_support' now has XXXX vectors.
-```
-
-### Step 7 — Launch the Streamlit app
+### Last Step: Launch the Streamlit app
 
 ```bash
-venv\Scripts\streamlit run app.py   # Windows
-# OR
-streamlit run app.py
+streamlit run app.py  # make sure venv is working (active) as mentioned in previous step, or run "venv\Scripts\activate" first in windows and equivalent command in mac/linux
 ```
 
 Open your browser at **http://localhost:8501**
@@ -207,37 +156,9 @@ Open your browser at **http://localhost:8501**
 ## Stopping / Cleanup
 
 ```bash
-# Stop Streamlit: Ctrl+C in terminal
-
-# Stop Qdrant container
 docker stop qdrant_amazon
-
-# Remove Qdrant container (keeps data in qdrant_storage/)
 docker rm qdrant_amazon
-
-# To fully reset and re-ingest: delete the collection
-# via Qdrant dashboard at http://localhost:6333/dashboard
 ```
 
----
-
-## Troubleshooting
-
-| Issue | Fix |
-|-------|-----|
-| `Connection refused` on Qdrant | Ensure Docker container is running: `docker ps` |
-| `HF_TOKEN invalid` | Check token at huggingface.co/settings/tokens |
-| `Collection is empty` | Run the ingestion script again |
-| Slow responses | HF Inference API has rate limits — add `HUGGINGFACEHUB_API_TOKEN` to your `.env` |
-| `ModuleNotFoundError` | Ensure venv is activated: `venv\Scripts\activate` |
-
----
-
-## Iteration History
-
-| File | Description |
-|------|-------------|
-| `agent/agent_iteration_01.md` | Dataset structuring (twcs.csv → filtered_amazon_dataset.csv) |
-| `agent/agent_iteration_02.md` | Dataset refinement |
-| `agent/agent_iteration_03.md` | Additional refinements |
-| `agent/agent_iteration_04.md` | **This iteration** — full-stack RAG app |
+## **IMPORTANT (Please open HIVER_REPORT.md)**
+To check the assignment related requirements
