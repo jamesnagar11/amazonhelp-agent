@@ -6,7 +6,7 @@
 
 - in the .env file, I have provided LANGCHAIN_TRACING_V2, LANGCHAIN_ENDPOINT, LANGCHAIN_API_KEY, LANGCHAIN_PROJECT and I have already added LANGSMITH_TRACING=true in the .env file.
 
-Now your task is to from langsmith import traceable.
+Now your task is to afrom langsmith import traceable.
 Then use this @traceable decorator over the whole pipeline and it's individual function with name, metadata and 1-2 tags each. 
 
 ## Expected Output:

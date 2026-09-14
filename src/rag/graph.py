@@ -2,15 +2,17 @@
 LangGraph graph assembly and compilation for the AmazonHelp CRAG pipeline.
 
 Graph flow:
-  START → get_intent → intent_evaluator
-        ↘ (human_escalated) → human_node → END
-        ↘ (else)            → rewrite_query → retriever → eval_retriever
-                                ↘ correct           → correct → brain_node → END
-                                ↘ ambiguous         → ambiguous → ambiguous_retriever
-                                                      → recompose_ambiguous_strips
-                                                          ↘ (escalate) → human_node → END
-                                                          ↘ (else)     → brain_node → END
-                                ↘ incorrect         → incorrect → human_node → END
+  START → get_intent
+        ↘ (rejected=True)  → END  (straight rejection, no human escalation)
+        ↘ (rejected=False) → intent_evaluator
+              ↘ (human_escalated) → human_node → END
+              ↘ (else)            → rewrite_query → retriever → eval_retriever
+                                      ↘ correct           → correct → brain_node → END
+                                      ↘ ambiguous         → ambiguous → ambiguous_retriever
+                                                            → recompose_ambiguous_strips
+                                                                ↘ (escalate) → human_node → END
+                                                                ↘ (else)     → brain_node → END
+                                      ↘ incorrect         → incorrect → human_node → END
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from src.rag.nodes import (
     route_after_intent_evaluator,
     route_after_eval_retriever,
     route_after_recompose_ambiguous,
+    route_after_get_intent,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,7 +71,16 @@ def build_graph() -> StateGraph:
 
     # ── Add edges ──────────────────────────────────────────────────────────
     builder.add_edge(START, "get_intent")
-    builder.add_edge("get_intent", "intent_evaluator")
+
+    # Conditional: get_intent → intent_evaluator OR END (if query rejected)
+    builder.add_conditional_edges(
+        "get_intent",
+        route_after_get_intent,
+        {
+            "intent_evaluator": "intent_evaluator",
+            END: END,
+        },
+    )
 
     # Conditional: intent_evaluator → rewrite_query OR human_node
     builder.add_conditional_edges(
@@ -192,6 +204,8 @@ def invoke_graph(
         "response": "",
         "escalation_reason": "",
         "human_escalated": False,
+        "rejected": False,
+        "reject_reason": None,
     }
 
     try:
@@ -273,6 +287,8 @@ def stream_graph(
         "response": "",
         "escalation_reason": "",
         "human_escalated": False,
+        "rejected": False,
+        "reject_reason": None,
     }
 
     final_result = initial_state.copy()
@@ -286,7 +302,12 @@ def stream_graph(
                 yield node_name, state_update
 
                 # Incremental memory save when response node completes
-                if node_name in ("brain_node", "human_node") and "response" in state_update and state_update["response"]:
+                # Covers: normal flow (brain_node/human_node) and rejected queries (get_intent → END)
+                is_terminal_with_response = (
+                    node_name in ("brain_node", "human_node")
+                    or (node_name == "get_intent" and state_update.get("rejected", False))
+                )
+                if is_terminal_with_response and "response" in state_update and state_update["response"]:
                     response_text = state_update["response"]
                     updated_messages = list(messages or []) + [
                         {"role": "human", "content": query},

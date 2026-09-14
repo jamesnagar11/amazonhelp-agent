@@ -44,3 +44,5 @@ qdrant_storage/
 twcs.csv
 data/filtered_amazon_dataset.csv
 data/intermediate_amazon_dataset.csv
+scratch
+models

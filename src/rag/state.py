@@ -41,6 +41,10 @@ class GraphState(TypedDict, total=False):
     # ── Processed context ──────────────────────────────────────────────────
     refined_context: str                # strip-filtered single context string
 
+    # ── Query rejection (non-Amazon / gibberish / off-topic) ───────────────
+    rejected: bool                      # True if query was rejected before pipeline
+    reject_reason: str | None           # LLM-provided reason, or None if not rejected
+
     # ── Final output ───────────────────────────────────────────────────────
     response: str                       # final answer to user
     escalation_reason: str             # why a human is needed

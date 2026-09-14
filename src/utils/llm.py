@@ -12,97 +12,81 @@ import os
 import logging
 from functools import lru_cache
 from dotenv import load_dotenv
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 # ── API Keys ──────────────────────────────────────────────────────────────────
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_ACCESS_TOKEN", "")
-OPEN_ROUTER_API_KEY = os.getenv("OPEN_ROUTER_API_KEY", "")
+HF_TOKENS_RAW = os.getenv("HF_TOKENS") or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_ACCESS_TOKEN", "")
+HF_TOKENS = [t.strip() for t in HF_TOKENS_RAW.split(",") if t.strip()]
+HF_TOKEN = HF_TOKENS[0] if HF_TOKENS else ""
 
 # ── Model names ───────────────────────────────────────────────────────────────
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-# OpenRouter model IDs
-CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen/qwen3-8b")
-JUDGE_MODEL = os.getenv("JUDGE_MODEL", "deepseek/deepseek-chat-v3-0324")
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+CHAT_MODEL = os.getenv("CHAT_MODEL", "Qwen/Qwen3.8-27B")
+JUDGE_MODEL = os.getenv("JUDGE_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash")
 
 
-@lru_cache(maxsize=4)
-def get_chat_llm(model: str = None, temperature: float = 0.3, max_tokens: int = 1024):
-    """Return a chat LLM for answer generation (Qwen3 via OpenRouter)."""
-    model = model or CHAT_MODEL
+# def _hf_llm(model: str, temperature: float, max_tokens: int, token_index: int = 0):
+#     """Create a HuggingFace Inference API Chat LLM using HuggingFaceEndpoint & ChatHuggingFace."""
+#     from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 
-    if OPEN_ROUTER_API_KEY:
-        return _openrouter_llm(model, temperature, max_tokens)
-    elif HF_TOKEN:
-        return _hf_llm(model, temperature, max_tokens)
-    else:
-        raise ValueError(
-            "No API key found. Set OPEN_ROUTER_API_KEY or HF_TOKEN in your .env file."
-        )
+#     token = HF_TOKENS[token_index % len(HF_TOKENS)] if HF_TOKENS else HF_TOKEN
+#     logger.info("Using HuggingFace Inference API for model: %s", model)
 
+#     endpoint = HuggingFaceEndpoint(
+#         repo_id=model,
+#         task="text-generation",
+#         max_new_tokens=max_tokens,
+#         temperature=temperature,
+#         huggingfacehub_api_token=token,
+#         do_sample=temperature > 0,
+#     )
+#     return ChatHuggingFace(llm=endpoint)
 
-@lru_cache(maxsize=4)
-def get_judge_llm(model: str = None, temperature: float = 0.1, max_tokens: int = 512):
-    """Return a judge/rewrite LLM (DeepSeek-V3 via OpenRouter)."""
-    model = model or JUDGE_MODEL
+def _hf_llm(model: str, temperature: float, max_tokens: int, token_index: int = 0):
+    from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 
-    if OPEN_ROUTER_API_KEY:
-        return _openrouter_llm(model, temperature, max_tokens)
-    elif HF_TOKEN:
-        return _hf_llm(model, temperature, max_tokens)
-    else:
-        raise ValueError(
-            "No API key found. Set OPEN_ROUTER_API_KEY or HF_TOKEN in your .env file."
-        )
+    token = HF_TOKENS[token_index % len(HF_TOKENS)] if HF_TOKENS else HF_TOKEN
+    logger.info("Using HuggingFace Inference API for model: %s", model)
 
-
-def _openrouter_llm(model: str, temperature: float, max_tokens: int):
-    """Create an OpenRouter LLM via ChatOpenAI-compatible interface."""
-    try:
-        from langchain_openai import ChatOpenAI
-
-        logger.info("Using OpenRouter for model: %s", model)
-        return ChatOpenAI(
-            model=model,
-            openai_api_key=OPEN_ROUTER_API_KEY,
-            openai_api_base=OPENROUTER_BASE_URL,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            default_headers={
-                "HTTP-Referer": "https://amazonhelp-agent.local",
-                "X-Title": "AmazonHelp RAG Agent",
-            },
-        )
-    except ImportError:
-        logger.warning("langchain-openai not installed, falling back to HuggingFace")
-        return _hf_llm(model, temperature, max_tokens)
-
-
-def _hf_llm(model: str, temperature: float, max_tokens: int):
-    """Create a HuggingFace Inference API LLM."""
-    from langchain_huggingface import HuggingFaceEndpoint
-
-    # Map OpenRouter model IDs back to HF model IDs
-    hf_model_map = {
-        "qwen/qwen3-8b": "Qwen/Qwen3-8B",
-        "deepseek/deepseek-chat-v3-0324": "deepseek-ai/DeepSeek-V3-0324",
-        "deepseek/deepseek-chat": "deepseek-ai/DeepSeek-V3",
-    }
-    hf_model = hf_model_map.get(model.lower(), model)
-
-    logger.info("Using HuggingFace for model: %s", hf_model)
-    return HuggingFaceEndpoint(
-        repo_id=hf_model,
+    endpoint = HuggingFaceEndpoint(
+        repo_id=model,
         task="text-generation",
         max_new_tokens=max_tokens,
         temperature=temperature,
-        huggingfacehub_api_token=HF_TOKEN,
+        huggingfacehub_api_token=token,
         do_sample=temperature > 0,
     )
+    return ChatHuggingFace(llm=endpoint)
+
+
+def get_chat_llm(model: str = None, temperature: float = 0.3, max_tokens: int = 1024):
+    """
+    Return chat LLM via HuggingFace Inference API (ChatHuggingFace).
+    NOTE: Not cached — different callers pass different max_tokens.
+    """
+    target_model = model or CHAT_MODEL
+    try:
+        return _hf_llm(target_model, temperature, max_tokens)
+    except Exception as e:
+        logger.error("get_chat_llm failed for model %s: %s", target_model, e)
+        raise
+
+
+def get_judge_llm(model: str = None, temperature: float = 0.1, max_tokens: int = 1024):
+    """
+    Return judge LLM via HuggingFace Inference API (ChatHuggingFace).
+    NOTE: Not cached — different callers may need different configs.
+    """
+    target_model = model or JUDGE_MODEL
+    try:
+        return _hf_llm(target_model, temperature, max_tokens)
+    except Exception as e:
+        logger.error("get_judge_llm failed for model %s: %s", target_model, e)
+        raise
 
 
 @lru_cache(maxsize=1)

@@ -3,6 +3,7 @@ from __future__ import annotations
 All LangGraph node functions for the AmazonHelp CRAG pipeline.
 
 Node list:
+  get_intent → (rejected?) → END
   get_intent → intent_evaluator → rewrite_query → retriever → eval_retriever
   → correct → brain_node
   → ambiguous → ambiguous_retriever → recompose_ambiguous_strips → brain_node
@@ -20,6 +21,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 from langsmith import traceable
+from langgraph.graph import END
 
 from src.rag.state import GraphState
 from src.rag.prompts import (
@@ -38,7 +40,7 @@ from src.rag.memory import build_context_string
 
 logger = logging.getLogger(__name__)
 
-STRIP_SCORE_THRESHOLD = 0.45
+STRIP_SCORE_THRESHOLD = 0.3
 CORRECT_THRESHOLD = 0.8
 AMBIGUOUS_LOW = 0.35
 AMBIGUOUS_HIGH = 0.7
@@ -49,6 +51,8 @@ AMBIGUOUS_HIGH = 0.7
 class IntentOutput(BaseModel):
     intent: str = Field(description="One of the 25 exact AmazonHelp intents")
     intent_score: int = Field(description="Base severity score 1-10")
+    should_reject: bool = Field(default=False, description="True if query is off-topic, gibberish, or unrelated to Amazon")
+    reject_reason: str | None = Field(default=None, description="LLM-provided rejection reason, or null if not rejected")
 
 class RewriteQueryOutput(BaseModel):
     user_query_rewritten: str = Field(description="Enhanced query for vector search")
@@ -79,25 +83,90 @@ class BrainNodeOutput(BaseModel):
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _parse_json(text: str, fallback: Any = None) -> Any:
-    """Robustly extract JSON from LLM output (handles markdown fences)."""
+    """Robustly extract JSON from LLM output (handles reasoning <think> tags, markdown fences & truncated outputs)."""
     if hasattr(text, "content"):
         text = text.content
-    text = str(text).strip()
-    # Strip markdown fences
-    text = re.sub(r"```(?:json)?\s*", "", text)
-    text = re.sub(r"```\s*$", "", text)
-    # Find first {...} or [...] block
-    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
+    raw_str = str(text).strip()
+    if not raw_str:
+        return fallback
+
+    # Strip <think>...</think> reasoning blocks
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw_str, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"```\s*$", "", cleaned).strip()
+
+    # 1. Try direct json.loads
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    # 2. Match exact JSON block
+    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", cleaned)
     if match:
         try:
             return json.loads(match.group(1))
-        except json.JSONDecodeError:
+        except Exception:
             pass
-    try:
-        return json.loads(text)
-    except Exception:
-        logger.warning("JSON parse failed for: %s…", text[:200])
-        return fallback
+
+    # 3. Attempt repair for truncated JSON object
+    obj_match = re.search(r"\{[\s\S]*", cleaned)
+    if obj_match:
+        snippet = obj_match.group(0)
+        fixed = snippet
+        if fixed.count('"') % 2 != 0:
+            fixed += '"'
+        if not fixed.rstrip().endswith("}"):
+            fixed += "}"
+        try:
+            return json.loads(fixed)
+        except Exception:
+            pass
+
+    # 4. Attempt repair for truncated JSON array
+    arr_match = re.search(r"\[[\s\S]*", cleaned)
+    if arr_match:
+        snippet = arr_match.group(0)
+        fixed = snippet
+        if fixed.count('"') % 2 != 0:
+            fixed += '"'
+        if fixed.count('{') > fixed.count('}'):
+            fixed += '}'
+        if not fixed.rstrip().endswith("]"):
+            fixed += "]"
+        try:
+            return json.loads(fixed)
+        except Exception:
+            pass
+
+    # 5. Regex extraction fallbacks for structured output schemas
+    # user_query_rewritten & fake_answer
+    rewritten_m = re.search(r'"user_query_rewritten"\s*:\s*"([^"]*)', cleaned)
+    fake_m = re.search(r'"fake_answer"\s*:\s*"([^"]*)', cleaned)
+    if rewritten_m or fake_m:
+        return {
+            "user_query_rewritten": rewritten_m.group(1) if rewritten_m else "",
+            "fake_answer": fake_m.group(1) if fake_m else "",
+        }
+
+    # intent & intent_score
+    intent_m = re.search(r'"intent"\s*:\s*"([^"]*)"', cleaned)
+    score_m = re.search(r'"intent_score"\s*:\s*(\d+)', cleaned)
+    if intent_m or score_m:
+        return {
+            "intent": intent_m.group(1) if intent_m else "General/Other",
+            "intent_score": int(score_m.group(1)) if score_m else 3,
+        }
+
+    # doc scores list
+    doc_scores = []
+    for d_match in re.finditer(r'\{\s*"doc_index"\s*:\s*(\d+)\s*,\s*"score"\s*:\s*([0-9.]+)\s*\}', cleaned):
+        doc_scores.append({"doc_index": int(d_match.group(1)), "score": float(d_match.group(2))})
+    if doc_scores:
+        return doc_scores
+
+    logger.warning("JSON parse failed for: %s…", raw_str[:200])
+    return fallback
 
 
 def _docs_to_text(docs: list[Document]) -> str:
@@ -133,7 +202,10 @@ def _score_and_filter_strips(
         strips_text=strips_text,
     )
     try:
-        raw = llm.invoke(prompt)
+        if hasattr(llm, "invoke"):
+            raw = llm.invoke(str(prompt))
+        else:
+            raw = str(llm(str(prompt)))
         scores_list = _parse_json(raw, fallback=[])
         if not isinstance(scores_list, list):
             scores_list = []
@@ -186,11 +258,56 @@ def detect_language(text: str) -> str:
         return "English"
 
 
+def _safe_structured_invoke(llm: Any, prompt: str, schema: Any = None) -> Any:
+    """
+    Invoke LLM safely. Uses structured output if supported (OpenAI/Gemini/Groq),
+    or cleanly invokes prompt + JSON parsing for HuggingFace/Inference API endpoints.
+    Raises on unrecoverable errors instead of silently returning empty/broken results.
+    """
+    llm_type_name = type(llm).__name__
+
+    if schema is not None and hasattr(llm, "with_structured_output") and "HuggingFace" not in llm_type_name:
+        try:
+            s_llm = llm.with_structured_output(schema)
+            res = s_llm.invoke(prompt)
+            if isinstance(res, schema):
+                return res
+            if isinstance(res, dict):
+                return res
+            parsed = _parse_json(res, fallback=None)
+            if parsed is not None:
+                return parsed
+        except NotImplementedError:
+            logger.debug("with_structured_output not supported by %s, falling back to raw invoke", llm_type_name)
+        except Exception as e:
+            logger.warning("with_structured_output failed (%s): %s — falling back to raw invoke", llm_type_name, e)
+
+    # Raw invocation (HuggingFace or fallback path)
+    try:
+        raw = llm.invoke(prompt)
+    except Exception as e:
+        logger.error("LLM raw invoke failed (%s): %s", llm_type_name, e)
+        raise
+
+    if schema is not None:
+        parsed = _parse_json(raw, fallback=None)
+        if parsed is not None:
+            return parsed
+        # Last resort: return the raw AIMessage content as a dict so callers
+        # can extract text from it (brain_node will handle this via the `else` branch)
+        raw_content = raw.content if hasattr(raw, "content") else str(raw)
+        logger.warning("_safe_structured_invoke: JSON parse failed, returning raw content wrapper")
+        return {"_raw": raw_content}
+    return raw
+
+
 # ── NODES ────────────────────────────────────────────────────────────────────
 
 @traceable(name="get_intent", tags=["node", "intent"], metadata={"step": "1_intent_classification"})
 def get_intent(state: GraphState) -> GraphState:
-    """Classify user query into one of 25 AmazonHelp intents & detect language."""
+    """Classify user query into one of 25 AmazonHelp intents & detect language.
+    Also detects off-topic / gibberish queries and marks them for rejection.
+    """
     from src.utils.llm import get_chat_llm
 
     llm = get_chat_llm()
@@ -202,37 +319,55 @@ def get_intent(state: GraphState) -> GraphState:
         query=query,
     )
     try:
-        if hasattr(llm, "with_structured_output"):
-            try:
-                s_llm = llm.with_structured_output(IntentOutput)
-                res = s_llm.invoke(prompt)
-                if isinstance(res, IntentOutput):
-                    intent = res.intent
-                    intent_score = res.intent_score
-                elif isinstance(res, dict):
-                    intent = res.get("intent", "General/Other")
-                    intent_score = int(res.get("intent_score", 3))
-                else:
-                    parsed = _parse_json(res, fallback={})
-                    intent = parsed.get("intent", "General/Other")
-                    intent_score = int(parsed.get("intent_score", 3))
-            except Exception:
-                raw = llm.invoke(prompt)
-                parsed = _parse_json(raw, fallback={})
-                intent = parsed.get("intent", "General/Other")
-                intent_score = int(parsed.get("intent_score", 3))
+        res = _safe_structured_invoke(llm, prompt, IntentOutput)
+        if isinstance(res, IntentOutput):
+            intent = res.intent
+            intent_score = res.intent_score
+            should_reject = res.should_reject
+            reject_reason = res.reject_reason if res.should_reject else None
+        elif isinstance(res, dict):
+            intent = res.get("intent", "General/Other")
+            intent_score = int(res.get("intent_score", 3))
+            should_reject = bool(res.get("should_reject", False))
+            reject_reason = res.get("reject_reason", None) if should_reject else None
         else:
-            raw = llm.invoke(prompt)
-            parsed = _parse_json(raw, fallback={})
-            intent = parsed.get("intent", "General/Other")
-            intent_score = int(parsed.get("intent_score", 3))
+            intent = "General/Other"
+            intent_score = 3
+            should_reject = False
+            reject_reason = None
     except Exception as e:
         logger.warning("get_intent failed: %s", e)
         intent = "General/Other"
         intent_score = 3
+        should_reject = False
+        reject_reason = None
+
+    if should_reject:
+        logger.info("Query REJECTED | Reason: %s | Lang: %s", reject_reason, detected_language)
+        rejection_response = (
+            f"I'm sorry, but I can only assist with Amazon-related queries. "
+            f"Reason: {reject_reason}"
+        )
+        return {
+            **state,
+            "intent": intent,
+            "intent_score": intent_score,
+            "detected_language": detected_language,
+            "rejected": True,
+            "reject_reason": reject_reason,
+            "response": rejection_response,
+            "human_escalated": False,
+        }
 
     logger.info("Intent: %s | Score: %d | Lang: %s", intent, intent_score, detected_language)
-    return {**state, "intent": intent, "intent_score": intent_score, "detected_language": detected_language}
+    return {
+        **state,
+        "intent": intent,
+        "intent_score": intent_score,
+        "detected_language": detected_language,
+        "rejected": False,
+        "reject_reason": None,
+    }
 
 
 @traceable(name="intent_evaluator", tags=["node", "evaluator"], metadata={"step": "2_intent_evaluation"})
@@ -276,23 +411,13 @@ def intent_evaluator(state: GraphState) -> GraphState:
             iteration_count=iteration_count,
         )
         try:
-            if hasattr(llm, "with_structured_output"):
-                try:
-                    s_llm = llm.with_structured_output(EscalationOutput)
-                    res = s_llm.invoke(prompt)
-                    if isinstance(res, EscalationOutput):
-                        escalation_reason = res.escalation_reason
-                    else:
-                        parsed = _parse_json(res, fallback={})
-                        escalation_reason = parsed.get("escalation_reason", "High-severity issue requiring human intervention.")
-                except Exception:
-                    raw = llm.invoke(prompt)
-                    parsed = _parse_json(raw, fallback={})
-                    escalation_reason = parsed.get("escalation_reason", "High-severity issue requiring human intervention.")
+            res = _safe_structured_invoke(llm, prompt, EscalationOutput)
+            if isinstance(res, EscalationOutput):
+                escalation_reason = res.escalation_reason
+            elif isinstance(res, dict):
+                escalation_reason = res.get("escalation_reason", "High-severity issue requiring human intervention.")
             else:
-                raw = llm.invoke(prompt)
-                parsed = _parse_json(raw, fallback={})
-                escalation_reason = parsed.get("escalation_reason", "High-severity issue requiring human intervention.")
+                escalation_reason = f"Escalated due to high intent score ({final_score}) for intent: {intent}"
         except Exception as e:
             logger.warning("Escalation reason generation failed: %s", e)
             escalation_reason = f"Escalated due to high intent score ({final_score}) for intent: {intent}"
@@ -309,7 +434,7 @@ def intent_evaluator(state: GraphState) -> GraphState:
 
 @traceable(name="rewrite_query", tags=["node", "rewrite"], metadata={"step": "3_hyde_rewrite"})
 def rewrite_query(state: GraphState) -> GraphState:
-    """Enhance query + generate HyDE fake answer using DeepSeek."""
+    """Enhance query + generate HyDE fake answer using DeepSeek/Qwen."""
     from src.utils.llm import get_judge_llm
 
     llm = get_judge_llm()
@@ -319,27 +444,16 @@ def rewrite_query(state: GraphState) -> GraphState:
         intent_score=state.get("intent_score", 3),
     )
     try:
-        if hasattr(llm, "with_structured_output"):
-            try:
-                s_llm = llm.with_structured_output(RewriteQueryOutput)
-                res = s_llm.invoke(prompt)
-                if isinstance(res, RewriteQueryOutput):
-                    rewritten = res.user_query_rewritten
-                    fake_answer = res.fake_answer
-                else:
-                    parsed = _parse_json(res, fallback={})
-                    rewritten = parsed.get("user_query_rewritten", state.get("query", ""))
-                    fake_answer = parsed.get("fake_answer", "")
-            except Exception:
-                raw = llm.invoke(prompt)
-                parsed = _parse_json(raw, fallback={})
-                rewritten = parsed.get("user_query_rewritten", state.get("query", ""))
-                fake_answer = parsed.get("fake_answer", "")
+        res = _safe_structured_invoke(llm, prompt, RewriteQueryOutput)
+        if isinstance(res, RewriteQueryOutput):
+            rewritten = res.user_query_rewritten
+            fake_answer = res.fake_answer
+        elif isinstance(res, dict):
+            rewritten = res.get("user_query_rewritten", state.get("query", ""))
+            fake_answer = res.get("fake_answer", "")
         else:
-            raw = llm.invoke(prompt)
-            parsed = _parse_json(raw, fallback={})
-            rewritten = parsed.get("user_query_rewritten", state.get("query", ""))
-            fake_answer = parsed.get("fake_answer", "")
+            rewritten = state.get("query", "")
+            fake_answer = ""
     except Exception as e:
         logger.warning("rewrite_query failed: %s", e)
         rewritten = state.get("query", "")
@@ -374,7 +488,7 @@ def retriever(state: GraphState) -> GraphState:
 @traceable(name="eval_retriever", tags=["node", "evaluator"], metadata={"step": "5_doc_scoring"})
 def eval_retriever(state: GraphState) -> GraphState:
     """
-    Score each retrieved document 0.0–1.0 using DeepSeek.
+    Score each retrieved document 0.0–1.0.
     Classify into correct (>0.8), ambiguous (0.35–0.8), incorrect (<0.35).
     """
     from src.utils.llm import get_judge_llm
@@ -399,20 +513,19 @@ def eval_retriever(state: GraphState) -> GraphState:
         documents_text=docs_text,
     )
     try:
-        if hasattr(llm, "with_structured_output"):
-            try:
-                s_llm = llm.with_structured_output(EvalRetrieverOutput)
-                res = s_llm.invoke(prompt)
-                if isinstance(res, EvalRetrieverOutput):
-                    scores_list = [{"doc_index": item.doc_index, "score": item.score} for item in res.scores]
-                else:
-                    scores_list = _parse_json(res, fallback=[])
-            except Exception:
-                raw = llm.invoke(prompt)
-                scores_list = _parse_json(raw, fallback=[])
+        res = _safe_structured_invoke(llm, prompt, EvalRetrieverOutput)
+        if isinstance(res, EvalRetrieverOutput):
+            scores_list = [{"doc_index": item.doc_index, "score": item.score} for item in res.scores]
+        elif isinstance(res, list):
+            scores_list = res
+        elif isinstance(res, dict):
+            raw_scores = res.get("scores", [])
+            if isinstance(raw_scores, list):
+                scores_list = raw_scores
+            else:
+                scores_list = [res]
         else:
-            raw = llm.invoke(prompt)
-            scores_list = _parse_json(raw, fallback=[])
+            scores_list = []
     except Exception as e:
         logger.warning("eval_retriever LLM failed: %s", e)
         scores_list = []
@@ -489,23 +602,13 @@ def incorrect(state: GraphState) -> GraphState:
         doc_scores=doc_scores,
     )
     try:
-        if hasattr(llm, "with_structured_output"):
-            try:
-                s_llm = llm.with_structured_output(EscalationOutput)
-                res = s_llm.invoke(prompt)
-                if isinstance(res, EscalationOutput):
-                    escalation_reason = res.escalation_reason
-                else:
-                    parsed = _parse_json(res, fallback={})
-                    escalation_reason = parsed.get("escalation_reason", "No relevant information found in knowledge base.")
-            except Exception:
-                raw = llm.invoke(prompt)
-                parsed = _parse_json(raw, fallback={})
-                escalation_reason = parsed.get("escalation_reason", "No relevant information found in knowledge base.")
+        res = _safe_structured_invoke(llm, prompt, EscalationOutput)
+        if isinstance(res, EscalationOutput):
+            escalation_reason = res.escalation_reason
+        elif isinstance(res, dict):
+            escalation_reason = res.get("escalation_reason", "No relevant information found in knowledge base.")
         else:
-            raw = llm.invoke(prompt)
-            parsed = _parse_json(raw, fallback={})
-            escalation_reason = parsed.get("escalation_reason", "No relevant information found in knowledge base.")
+            escalation_reason = "No relevant information found in knowledge base."
     except Exception as e:
         logger.warning("incorrect node LLM failed: %s", e)
         escalation_reason = "Unable to find relevant information. Routing to human agent."
@@ -538,27 +641,16 @@ def ambiguous(state: GraphState) -> GraphState:
         low_score_excerpts=low_score_excerpts or "No low-scoring excerpts available.",
     )
     try:
-        if hasattr(llm, "with_structured_output"):
-            try:
-                s_llm = llm.with_structured_output(AmbiguousRewriteOutput)
-                res = s_llm.invoke(prompt)
-                if isinstance(res, AmbiguousRewriteOutput):
-                    refined_query = res.refined_query
-                    refined_fake = res.refined_fake_answer
-                else:
-                    parsed = _parse_json(res, fallback={})
-                    refined_query = parsed.get("refined_query", state.get("user_query_rewritten", ""))
-                    refined_fake = parsed.get("refined_fake_answer", state.get("fake_answer", ""))
-            except Exception:
-                raw = llm.invoke(prompt)
-                parsed = _parse_json(raw, fallback={})
-                refined_query = parsed.get("refined_query", state.get("user_query_rewritten", ""))
-                refined_fake = parsed.get("refined_fake_answer", state.get("fake_answer", ""))
+        res = _safe_structured_invoke(llm, prompt, AmbiguousRewriteOutput)
+        if isinstance(res, AmbiguousRewriteOutput):
+            refined_query = res.refined_query
+            refined_fake = res.refined_fake_answer
+        elif isinstance(res, dict):
+            refined_query = res.get("refined_query", state.get("user_query_rewritten", ""))
+            refined_fake = res.get("refined_fake_answer", state.get("fake_answer", ""))
         else:
-            raw = llm.invoke(prompt)
-            parsed = _parse_json(raw, fallback={})
-            refined_query = parsed.get("refined_query", state.get("user_query_rewritten", ""))
-            refined_fake = parsed.get("refined_fake_answer", state.get("fake_answer", ""))
+            refined_query = state.get("user_query_rewritten", state.get("query", ""))
+            refined_fake = state.get("fake_answer", "")
     except Exception as e:
         logger.warning("ambiguous node failed: %s", e)
         refined_query = state.get("user_query_rewritten", state.get("query", ""))
@@ -592,34 +684,36 @@ def ambiguous_retriever(state: GraphState) -> GraphState:
 @traceable(name="recompose_ambiguous_strips", tags=["node", "strip_filtering"], metadata={"step": "8_ambiguous_recompose"})
 def recompose_ambiguous_strips(state: GraphState) -> GraphState:
     """
-    Score strips from 4 ambiguous docs, filter, recompose.
-    If < 10% strips above 0.4 → escalate to human.
+    Use document-level scores from evaluated_docs (set by eval_retriever) to filter docs.
+    Discard docs whose score is STRICTLY less than 0.3. Combine the rest into refined_context.
+    Escalate to human_node only if NO doc scored >= 0.3.
     """
     from src.utils.llm import get_chat_llm
 
     llm = get_chat_llm()
-    docs = state.get("documents", [])
     query = state.get("query", "")
     intent = state.get("intent", "")
 
-    combined_text = "\n\n".join(doc.page_content for doc in docs)
-    strips = _split_into_strips(combined_text)
+    # Use already-evaluated doc scores from state (set by eval_retriever)
+    evaluated_docs = state.get("evaluated_docs", [])
 
-    kept_strips, all_scores = _score_and_filter_strips(strips, query, intent, llm, threshold=0.45)
+    if not evaluated_docs:
+        # Fallback: if evaluated_docs not present, use raw documents with score 0.0
+        docs = state.get("documents", [])
+        evaluated_docs = [{"doc": d, "score": 0.0} for d in docs]
 
-    # Check if less than 10% of strips are above 0.4
-    above_threshold = sum(1 for s in all_scores if s["score"] > 0.4)
-    total = len(all_scores)
-    threshold_pct = (above_threshold / total) if total > 0 else 0
+    # Filter: keep only docs with score >= 0.3 (discard strictly < 0.3)
+    passing_docs = [e for e in evaluated_docs if e["score"] >= 0.3]
+    all_scores_summary = ", ".join(f"{e['score']:.2f}" for e in evaluated_docs)
 
     logger.info(
-        "recompose_ambiguous_strips: %d/%d strips above 0.4 (%.0f%%)",
-        above_threshold, total, threshold_pct * 100
+        "recompose_ambiguous_strips: %d/%d docs passed score >= 0.3 (scores: [%s])",
+        len(passing_docs), len(evaluated_docs), all_scores_summary
     )
 
-    if threshold_pct < 0.10 or not kept_strips:
-        # Escalate to human
-        strip_scores_summary = f"{above_threshold}/{total} strips above 0.4 threshold"
+    # Escalate only if NO docs have score >= 0.3
+    if not passing_docs:
+        strip_scores_summary = f"All evaluated docs scored below 0.3: [{all_scores_summary}]"
         prompt = AMBIGUOUS_ESCALATION_PROMPT.format(
             query=query,
             intent=intent,
@@ -627,30 +721,27 @@ def recompose_ambiguous_strips(state: GraphState) -> GraphState:
             strip_scores_summary=strip_scores_summary,
         )
         try:
-            if hasattr(llm, "with_structured_output"):
-                try:
-                    s_llm = llm.with_structured_output(EscalationOutput)
-                    res = s_llm.invoke(prompt)
-                    if isinstance(res, EscalationOutput):
-                        escalation_reason = res.escalation_reason
-                    else:
-                        parsed = _parse_json(res, fallback={})
-                        escalation_reason = parsed.get("escalation_reason", "Insufficient relevant content after two-stage retrieval.")
-                except Exception:
-                    raw = llm.invoke(prompt)
-                    parsed = _parse_json(raw, fallback={})
-                    escalation_reason = parsed.get("escalation_reason", "Insufficient relevant content after two-stage retrieval.")
+            res = _safe_structured_invoke(llm, prompt, EscalationOutput)
+            if isinstance(res, EscalationOutput):
+                escalation_reason = res.escalation_reason
+            elif isinstance(res, dict):
+                escalation_reason = res.get("escalation_reason", "Insufficient relevant content after two-stage retrieval.")
             else:
-                raw = llm.invoke(prompt)
-                parsed = _parse_json(raw, fallback={})
-                escalation_reason = parsed.get("escalation_reason", "Insufficient relevant content after two-stage retrieval.")
+                escalation_reason = "Insufficient relevant content after two-stage retrieval."
         except Exception as e:
             logger.warning("recompose escalation prompt failed: %s", e)
             escalation_reason = "Insufficient relevant content found after two-stage retrieval. Human agent required."
 
         return {**state, "escalation_reason": escalation_reason, "human_escalated": True}
 
-    refined_context = "\n".join(kept_strips)
+    # Combine passing docs into refined context (preserve doc order by score desc)
+    passing_docs_sorted = sorted(passing_docs, key=lambda e: e["score"], reverse=True)
+    refined_context = "\n\n".join(e["doc"].page_content for e in passing_docs_sorted)
+
+    logger.info(
+        "recompose_ambiguous_strips: context built from %d docs, total %d chars",
+        len(passing_docs), len(refined_context)
+    )
     return {**state, "refined_context": refined_context, "human_escalated": False}
 
 
@@ -662,7 +753,7 @@ def brain_node(state: GraphState) -> GraphState:
     """
     from src.utils.llm import get_chat_llm
 
-    llm = get_chat_llm(max_tokens=512)
+    llm = get_chat_llm(max_tokens=1024)
 
     conversation_history = build_context_string(
         state.get("summary_list", []),
@@ -680,37 +771,34 @@ def brain_node(state: GraphState) -> GraphState:
         conversation_history=conversation_history or "No previous conversation.",
         refined_context=state.get("refined_context", "No relevant context retrieved."),
     )
+    response = ""
     try:
-        if hasattr(llm, "with_structured_output"):
-            try:
-                s_llm = llm.with_structured_output(BrainNodeOutput)
-                res = s_llm.invoke(prompt)
-                if isinstance(res, BrainNodeOutput):
-                    response = res.response
-                elif isinstance(res, dict):
-                    response = res.get("response", "")
-                else:
-                    parsed = _parse_json(res, fallback={})
-                    response = parsed.get("response", "")
-                if not response:
-                    response = str(res.content if hasattr(res, "content") else res).strip()
-            except Exception:
-                raw = llm.invoke(prompt)
-                parsed = _parse_json(raw, fallback={})
-                response = parsed.get("response", "")
-                if not response:
-                    response = str(raw.content if hasattr(raw, "content") else raw).strip()
+        res = _safe_structured_invoke(llm, prompt, BrainNodeOutput)
+        if isinstance(res, BrainNodeOutput):
+            response = res.response
+        elif isinstance(res, dict):
+            # Normal JSON parse path: {"response": "..."}  or  {"_raw": "..."} fallback
+            response = res.get("response") or res.get("_raw", "")
+            # Strip any remaining JSON wrapper from raw content
+            if not response and res:
+                response = str(res)
         else:
-            raw = llm.invoke(prompt)
-            parsed = _parse_json(raw, fallback={})
-            response = parsed.get("response", "")
-            if not response:
-                response = str(raw.content if hasattr(raw, "content") else raw).strip()
+            # AIMessage or plain string
+            response = str(res.content if hasattr(res, "content") else res).strip()
     except Exception as e:
         logger.error("brain_node failed: %s", e)
         response = (
             "I'm sorry, I encountered an issue generating a response. "
             "Our @AmazonHelp support team is reviewing your request to assist you."
+        )
+
+    # Final guard: ensure we never return an empty or JSON-literal response
+    if not response or response in ("{}", "None", "null"):
+        logger.warning("brain_node: empty/invalid response from LLM, using fallback")
+        response = (
+            "I don't have enough information to fully resolve this directly. "
+            "Please contact Amazon support at amazon.com/help or call 1-888-280-4331 "
+            "for immediate assistance with your issue."
         )
 
     logger.info("brain_node response: %s…", response[:100])
@@ -745,6 +833,14 @@ def human_node(state: GraphState) -> GraphState:
 
 
 # ── Conditional edge functions ────────────────────────────────────────────────
+
+@traceable(name="route_after_get_intent", tags=["router", "intent"], metadata={"component": "conditional_edge"})
+def route_after_get_intent(state: GraphState) -> str:
+    """Route to END immediately if query was rejected, else continue to intent_evaluator."""
+    if state.get("rejected", False):
+        return END
+    return "intent_evaluator"
+
 
 @traceable(name="route_after_intent_evaluator", tags=["router", "intent"], metadata={"component": "conditional_edge"})
 def route_after_intent_evaluator(state: GraphState) -> str:

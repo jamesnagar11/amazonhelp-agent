@@ -31,7 +31,8 @@ if "dark_mode" not in st.session_state:
     st.session_state.dark_mode = True
 
 # ── CSS Theming ────────────────────────────────────────────────────────────────
-def inject_css(dark: bool):
+@st.cache_data(show_spinner=False)
+def _build_css(dark: bool) -> str:
     if dark:
         bg = "#0d0e12"
         sidebar_bg = "#16171d"
@@ -105,9 +106,16 @@ def inject_css(dark: bool):
         glow_top = "radial-gradient(circle, rgba(11, 87, 208, 0.12) 0%, rgba(124, 77, 255, 0.08) 45%, transparent 70%)"
         glow_bottom = "radial-gradient(circle, rgba(14, 165, 233, 0.10) 0%, rgba(59, 130, 246, 0.06) 45%, transparent 70%)"
 
-    st.markdown(f"""
+    return f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+    /* Hide Streamlit's built-in "Press Ctrl+Enter to submit form" hint */
+    .stForm [data-testid="InputInstructions"],
+    [data-testid="InputInstructions"] {{
+        display: none !important;
+        visibility: hidden !important;
+    }}
 
     :root {{
         --bg: {bg};
@@ -377,8 +385,9 @@ def inject_css(dark: bool):
         border-radius: 12px !important;
         font-weight: 600 !important;
         font-size: 0.92rem !important;
-        padding: 10px 18px !important;
+        padding: 10px 12px !important;
         min-height: 44px !important;
+        width: 100% !important;
         box-shadow: 0 4px 14px var(--accent-glow) !important;
         transition: all 0.2s ease !important;
     }}
@@ -392,6 +401,35 @@ def inject_css(dark: bool):
     .stFormSubmitButton button * {{
         color: #ffffff !important;
         font-weight: 600 !important;
+        white-space: nowrap !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+    }}
+
+    /* Top Right Evaluation Notice */
+    .top-right-notice {{
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        z-index: 999999;
+        background: var(--card-bg);
+        border: 1.5px solid var(--accent);
+        color: var(--text);
+        padding: 12px 18px;
+        border-radius: 12px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+        font-size: 0.84rem;
+        line-height: 1.45;
+        max-width: 340px;
+        animation: fadeInRightNotice 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+        backdrop-filter: blur(8px);
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }}
+    @keyframes fadeInRightNotice {{
+        from {{ opacity: 0; transform: translateY(-12px) scale(0.95); }}
+        to   {{ opacity: 1; transform: translateY(0) scale(1); }}
     }}
 
     /* Sidebar Secondary Buttons (FIXES THEME TOGGLE BLACK-ON-BLACK ISSUE) */
@@ -558,7 +596,11 @@ def inject_css(dark: bool):
         line-height: 1.65;
     }}
     </style>
-    """, unsafe_allow_html=True)
+    """
+
+
+def inject_css(dark: bool):
+    st.markdown(_build_css(dark), unsafe_allow_html=True)
 
 
 # ── Session state initialization ──────────────────────────────────────────────
@@ -827,8 +869,22 @@ def handle_query(user_input: str):
     nodes_visited = []
     escalated = False
 
+    notice_placeholder = st.empty()
     status_placeholder = st.empty()
     typing_placeholder = st.empty()
+
+    notice_placeholder.markdown(
+        """
+        <div class="top-right-notice">
+            <span style="font-size:1.3rem;">⏳</span>
+            <div>
+                <strong>Pipeline Evaluating...</strong><br>
+                <span style="opacity:0.88;font-size:0.78rem;">This pipeline might take 20-30 seconds because of free API keys so please wait till it evaluates and gets back to you.</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     typing_placeholder.markdown(
         '<div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div><div class="clearfix"></div>',
@@ -880,9 +936,10 @@ def handle_query(user_input: str):
             "Please try again or contact Amazon support directly at amazon.com/help."
         )
 
-    # Clear typing and status
+    # Clear typing, status and notice
     typing_placeholder.empty()
     status_placeholder.empty()
+    notice_placeholder.empty()
 
     if not response_text:
         response_text = "I'm sorry, I wasn't able to generate a response. Please try again."
@@ -915,7 +972,7 @@ def render_input_area():
     st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
 
     with st.form("chat_form", clear_on_submit=True):
-        col1, col2 = st.columns([8, 1])
+        col1, col2 = st.columns([7, 1.4])
         with col1:
             user_input = st.text_area(
                 "Message",

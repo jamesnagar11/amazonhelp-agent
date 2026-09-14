@@ -36,11 +36,37 @@ INTENT_LIST = """
 
 # ── get_intent prompt ────────────────────────────────────────────────────────
 GET_INTENT_PROMPT = PromptTemplate.from_template(
-    """You are an expert Amazon customer support intent classifier.
+    """You are an expert Amazon customer support intent classifier specializing in real-world customer service messages and tweets (@AmazonHelp).
 
-TASK: Classify the customer query into exactly ONE of the 25 intents listed below.
-Return ONLY a JSON object with two keys: "intent" and "intent_score".
-Do NOT add any explanation or extra text — output ONLY the JSON.
+TASK:
+Analyze the customer query and do TWO things:
+  1. Determine if the query should be REJECTED (see REJECTION RULES below).
+  2. If NOT rejected, classify it into exactly ONE of the 25 intents from the INTENT LIST.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REJECTION RULES — evaluate these FIRST:
+Reject the query (set should_reject=true) if it meets ANY of the following:
+  a) Completely unrelated to Amazon, its products, services, or customer support
+     (e.g. weather questions, math homework, political opinions, competitor-only topics)
+  b) Personal agenda, spam, or promotional content not involving Amazon
+  c) Pure gibberish, incomprehensible text, or random characters with no discernible meaning
+  d) Offensive content or harassment that has no Amazon support context
+
+Do NOT reject:
+  - Frustrated or angry Amazon customers — even if they use strong language
+  - Queries that reference Amazon products, orders, accounts, or services in any way
+  - Vague queries that could plausibly relate to an Amazon issue
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+INTERNAL REASONING & DISAMBIGUATION RULES (apply ONLY if NOT rejected):
+1. Identify the Primary Operational Goal: Determine the core practical action or information the customer needs (e.g., tracking a package, refund status, account access, product issue, billing).
+2. Distinguish Operational Issues from Escalations (CRITICAL):
+   - Real-world customers frequently use frustrated, angry, or emotional language (e.g., "terrible service", "useless support", "worst experience").
+   - Do NOT classify a query as "Customer Service Complaint (Escalation)" simply because the tone is angry or contains complaints about general service.
+   - Classify as "Customer Service Complaint (Escalation)" ONLY if the primary issue is specifically about agent/bot misconduct, previous representative failure, or an explicit request to escalate to management where no specific operational item/order/delivery issue can be identified.
+   - If an operational issue is present (e.g., package delayed, missing item, wrong charge, refund not received), ALWAYS select the specific operational intent instead of escalation.
+3. Evaluate Against All Candidates: Internally compare the query against each candidate intent to find the single most accurate, specific match.
+4. Score Alignment: Set "intent_score" to the exact base_score corresponding to the chosen intent as specified in the INTENT LIST.
 
 INTENT LIST (name → base_score):
 {intent_list}
@@ -48,8 +74,13 @@ INTENT LIST (name → base_score):
 CUSTOMER QUERY:
 {query}
 
+OUTPUT RULES:
+- If should_reject is true:  set intent to "General/Other", intent_score to 1, and provide a short reject_reason explaining why the query is outside Amazon support scope.
+- If should_reject is false: set should_reject=false and reject_reason=null; fill intent and intent_score normally.
+- Output ONLY the JSON object below — no explanation, no extra text.
+
 Output format (strict JSON):
-{{"intent": "<exact intent name from list>", "intent_score": <integer 1-10>}}"""
+{{"intent": "<exact intent name from list>", "intent_score": <integer 1-10>, "should_reject": <true|false>, "reject_reason": "<short reason string or null>"}}"""
 )
 
 # ── rewrite_query prompt ─────────────────────────────────────────────────────

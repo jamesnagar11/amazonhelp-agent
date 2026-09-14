@@ -38,7 +38,7 @@ OUTPUT_DIR = PROJECT_ROOT / "evaluation_results"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_golden_queries(filepath: Path, max_samples: int = 10) -> list[dict]:
+def load_golden_queries(filepath: Path, start_index: int = 0, max_samples: int = 0) -> list[dict]:
     """Load evaluation test cases from golden_dataset.csv."""
     if not filepath.exists():
         logger.error("Golden dataset not found at: %s", filepath)
@@ -51,7 +51,7 @@ def load_golden_queries(filepath: Path, max_samples: int = 10) -> list[dict]:
             gid = row.get("conversation_group_id", "").strip()
             groups[gid].append(row)
 
-    eval_cases = []
+    all_cases = []
     for gid, rows in groups.items():
         # Find first inbound user tweet
         inbound_tweets = [r for r in rows if r.get("inbound", "").lower() == "true"]
@@ -62,17 +62,20 @@ def load_golden_queries(filepath: Path, max_samples: int = 10) -> list[dict]:
         if not user_query:
             continue
 
-        eval_cases.append({
+        all_cases.append({
             "group_id": gid,
             "query": user_query,
             "rule_number": rule_number,
             "all_rows": rows,
         })
 
-        if 0 < max_samples <= len(eval_cases):
-            break
+    start = max(0, start_index)
+    if max_samples > 0:
+        eval_cases = all_cases[start : start + max_samples]
+    else:
+        eval_cases = all_cases[start:]
 
-    logger.info("Loaded %d evaluation query cases from %s", len(eval_cases), filepath.name)
+    logger.info("Loaded %d evaluation query cases (starting from index %d) from %s", len(eval_cases), start, filepath.name)
     return eval_cases
 
 
@@ -116,13 +119,13 @@ Format: {{"faithfulness": 0.9, "relevance": 0.95}}"""
         return 0.8, max(rel_h, 0.5)
 
 
-def run_evaluation(max_samples: int = 10) -> dict:
+def run_evaluation(start_index: int = 0, max_samples: int = 0) -> dict:
     """Run full evaluation harness."""
     from src.rag.graph import invoke_graph
     from src.utils.llm import get_judge_llm
 
     logger.info("=== Starting RAGAS & Agent Evaluation Harness ===")
-    test_cases = load_golden_queries(GOLDEN_CSV_PATH, max_samples=max_samples)
+    test_cases = load_golden_queries(GOLDEN_CSV_PATH, start_index=start_index, max_samples=max_samples)
 
     if not test_cases:
         logger.error("No evaluation cases loaded!")
@@ -185,7 +188,7 @@ def run_evaluation(max_samples: int = 10) -> dict:
             intent_correct_count += 1
 
         results.append({
-            "case_id": idx,
+            "case_id": start_index + idx,
             "group_id": case["group_id"],
             "query": query,
             "predicted_intent": pred_intent,
@@ -198,6 +201,10 @@ def run_evaluation(max_samples: int = 10) -> dict:
             "relevance": relevance,
             "latency_sec": latency,
         })
+
+        if idx < len(test_cases):
+            logger.info("Waiting 30 seconds before processing next test case...")
+            time.sleep(30)
 
     elapsed_time = round(time.time() - start_time, 2)
     n = len(results)
@@ -248,7 +255,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run RAGAS Evaluation Harness against golden_dataset.csv")
     parser.add_argument("--max-samples", type=int, default=0, help="Max test samples to run (0 or -1 for ALL 200 cases)")
     parser.add_argument("--all", action="store_true", help="Run evaluation on ALL 200 cases in golden_dataset.csv")
+    parser.add_argument("--range", nargs=2, type=int, metavar=("START", "COUNT"), help="Evaluate COUNT queries starting from index START (0-indexed)")
     args = parser.parse_args()
 
-    samples = 0 if args.all else args.max_samples
-    run_evaluation(max_samples=samples)
+    if args.range:
+        start_idx, samples = args.range
+    elif args.all:
+        start_idx = 0
+        samples = 0
+    else:
+        start_idx = 0
+        samples = args.max_samples
+
+    run_evaluation(start_index=start_idx, max_samples=samples)
